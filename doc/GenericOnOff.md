@@ -137,5 +137,135 @@ TODO：对于不需要 state transition 的 state，有待研究。
 
 ### message
 
+Spec 定义了 4 条操作 onoff state 的消息，而 Server 端需要接收其中的三条消息，如下图：
 
+![](images/image-20210804102937282.png)
+
+在 btstack 中，这一切都实现在 `mesh_generic_on_off_model_operations[]` 这个结构体数组里，**该数组必须以 NULL 结束**。
+
+```C
+// Generic On Off Message
+const static mesh_operation_t mesh_generic_on_off_model_operations[] = {
+    { MESH_GENERIC_ON_OFF_GET,                                  				 0, 		generic_on_off_get_handler },
+    { MESH_GENERIC_ON_OFF_SET,                                   				 2, 		 generic_on_off_set_handler },
+    { MESH_GENERIC_ON_OFF_SET_UNACKNOWLEDGED,      2,		   generic_on_off_set_unacknowledged_handler },
+    { 0, 0, NULL }
+};
+```
+
+该结构体是 opcode 和相应处理函数的结合：
+
+```C
+// function to handle model operation message
+typedef void (*mesh_operation_handler)(struct mesh_model * mesh_model, mesh_pdu_t * pdu);
+
+typedef struct {
+    uint32_t opcode;
+    uint16_t minimum_length;
+    mesh_operation_handler handler;
+} mesh_operation_t;
+```
+
+### model
+
+btstack 里 model 结构体包含下述成员：
+
+```C
+typedef struct mesh_model {
+    // linked list item
+    btstack_linked_item_t item;
+    // element
+    struct mesh_element * element;
+    // internal model enumeration
+    uint16_t mid;
+    // vendor_id << 16 | model id, use BLUETOOTH_COMPANY_ID_BLUETOOTH_SIG_INC for SIG models
+    uint32_t model_identifier;
+    // model operations
+    const mesh_operation_t * operations;
+    // publication model if supported
+    mesh_publication_model_t * publication_model;
+    // data
+    void * model_data;
+    // bound appkeys
+    uint16_t appkey_indices[MAX_NR_MESH_APPKEYS_PER_MODEL];
+    // subscription list
+    uint16_t subscriptions[MAX_NR_MESH_SUBSCRIPTION_PER_MODEL];
+    // packet handler for transition events in server, event callback handler in client
+    btstack_packet_handler_t model_packet_handler;
+} mesh_model_t;
+```
+
+这里面的 `model_data` ，`operations` 就是我们之前解释的 state 和 message 处理结构体数组。
+
+- `model_identifier` -  一个 32 bits 的变量，用于表示该 model 的标识符
+
+每一个 model 都有一个标识符（Model identifier），可以是 SIG 联盟定义的 16 bits 标识符，也可以是厂商自定义的 32 bits Vendor Model 标识符，其格式如下图。SIG 联盟定义的一系列标准的 model，其标识符可以在 **MshMDL v1.0.1 - 7 Summary - 7.3 Models summary** 里找到。
+
+![](images/image-20210803152532778.png)
+
+- `item` 是链表节点。
+- `mid` 是内部使用的 enum 值。
+- `publication_model` 是该 model 支持的 publication 功能。
+- `appkey_indices` - AppKeys 列表。
+- `subscriptions` - model 订阅列表。
+
+上述的这些成员其实在 Mesh Spec 的 **4 Foundation models - 4.2 State Definitions** 里有介绍。
+
+### 数据收发
+
+在 mesh_generic_on_off_server.c 文件里搜索 `mesh_upper` ，就能够找到所有数据收发相关的内容了。
+
+**发送数据：**
+
+onoff server 当收到 set acknowledge 或 get 消息后会返回 status 消息，这个时候 server 就需要主动发送数据了。
+
+```C
+// message builder using template
+mesh_upper_transport_pdu_t * mesh_access_setup_message(const mesh_access_message_t *message_template, ...);
+```
+
+`mesh_access_setup_message()` 函数用于构建一个 upper transport pdu ，函数参数数量可变，根据 `message_template` 传入不同数量的参数用于构建 message 。
+
+以 onoff status 为例，它有两种格式，一种是 1 字节的，另一种是 3 字节的，参考下图：
+
+![](images/image-20210804153045271.png)
+
+而 btstack 里则对应与瞬时的（instantaneous）或过渡的（transition），如下述代码：
+
+```C
+const mesh_access_message_t mesh_generic_on_off_status_transition = {
+        MESH_GENERIC_ON_OFF_STATUS, "111"
+};
+const mesh_access_message_t mesh_generic_on_off_status_instantaneous = {
+        MESH_GENERIC_ON_OFF_STATUS, "1"
+};
+```
+
+`MESH_GENERIC_ON_OFF_STATUS` 代表 onoff status message 的 opcode，后面的 "111" 和 "1" 则代表消息数据的 format，
+
+- '1' - 1 byte
+- '2' - 2 byte
+- '3' - 3 byte
+- '4' - 4 byte
+- 'm' - model identifier
+
+因此使用 `mesh_generic_on_off_status_transition` 格式构建 message 时，需要传入 current_value, target_vaule 和 remaining_time 这三个值，如下代码：
+
+```C
+mesh_access_setup_message(&mesh_generic_on_off_status_transition, state->transition_data.current_value, state->transition_data.target_value, remaining_time);
+```
+
+上述的代码在 upper transport pdu 里添加了一条 model message，或者说是 access pdu，现在还需要用 `mesh_upper_transport_setup_access_pdu_header()` 函数构建 access pdu header，然后就可以用 `mesh_access_send_unacknowledged_pdu()` 发送 pdu 了。
+
+```C
+uint8_t mesh_upper_transport_setup_access_pdu_header(mesh_pdu_t * pdu, uint16_t netkey_index, uint16_t appkey_index, uint8_t ttl, uint16_t src, uint16_t dest, uint8_t szmic);
+```
+
+**接收数据：**
+
+接收数据主要涉及解析 pdu，btstack 里提供了 `mesh_access_parser_*()` 来解析 access message， 先调用 `mesh_access_parser_init()` 初始化解析器，然后就可以依次调用 `mesh_access_parser_get_*()` 函数从解析器里获取数据了，例如 uint8_t, uint32_t, key, model_identifier 等等，利用 `mesh_access_parser_available()` 判断解析器里是否有多余的数据。
+
+消息处理完毕后需要调用 `mesh_access_message_processed()` 通知 access 层这个 access message 已经被更高层处理了。
+
+state transition 完成后，需要调用 `mesh_access_emit_state_update_*()` 系列函数通知用于发送了相应的事件，用户需要在相应事件里处理实际的硬件变化。
 
